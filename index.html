@@ -1,0 +1,373 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Found on the Oval</title>
+  <script type="module" src="https://cdn.jsdelivr.net/npm/@google/model-viewer@4.4.0/dist/model-viewer.min.js"></script>
+  <style>
+    html, body { margin: 0; height: 100%; font-family: system-ui, sans-serif; background: #f4f1ec; color: #222; }
+    #panel { position: fixed; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; text-align: center; padding: 24px; }
+    h1 { margin: 0 0 8px; font-size: 26px; color: #bb0000; }
+    #status { font-size: 20px; margin: 16px 0 4px; }
+    #coords { font: 12px ui-monospace, monospace; opacity: .6; }
+    button { font: inherit; font-size: 18px; padding: 14px 40px; border: 0; border-radius: 999px; background: #bb0000; color: #fff; font-weight: 600; }
+    #object-stage { position: fixed; inset: 0; display: none; z-index: 10; background: #f4f1ec; }
+    #object-stage.open { display: block; }
+    model-viewer { position: absolute; inset: 0; width: 100%; height: 100%; background: #f4f1ec; }
+    body.preview #panel { display: none; }
+    #close-model { position: absolute; z-index: 1; top: 16px; left: 16px; padding: 10px 16px; font-size: 15px; }
+    body.preview #close-model { display: none; }
+    model-viewer [slot="ar-button"] { position: absolute; bottom: 24px; left: 50%; transform: translateX(-50%); }
+    #open-nearby { margin-top: 16px; }
+    #model-message { position: absolute; z-index: 1; top: 50%; left: 50%; transform: translate(-50%, -50%); width: min(320px, 85vw); text-align: center; }
+    #model-message.ar-error { top: auto; bottom: 95px; transform: translateX(-50%); background: #f4f1ec; border-radius: 12px; padding: 8px; }
+    #model-message p { margin: 0 0 10px; }
+    #scout { display: none; width: 100%; max-width: 420px; margin-top: 16px; }
+    #scout.on { display: block; }
+    #spots { list-style: none; padding: 0; margin: 16px 0 0; text-align: left; font: 13px ui-monospace, monospace; }
+    #spots li { background: #fff; border-radius: 10px; padding: 10px 12px; margin-bottom: 8px; }
+    #spots b { font-family: system-ui, sans-serif; }
+  </style>
+</head>
+<body>
+  <div id="panel">
+    <h1>Found on the Oval</h1>
+    <p>Walk to the spots to unlock the objects.</p>
+    <button id="go">Start</button>
+    <div id="status" role="status"></div>
+    <div id="coords"></div>
+    <button id="open-nearby" hidden>View nearby object</button>
+
+    <!-- Scout mode (?scout): walk the Oval and mark candidate spots -->
+    <div id="scout">
+      <button id="mark" disabled>Mark this spot</button>
+      <ul id="spots"></ul>
+    </div>
+  </div>
+
+  <div id="object-stage">
+    <button id="close-model">Back to exploring</button>
+    <div id="models"></div>
+    <div id="model-message" hidden>
+      <p id="model-status" role="status"></p>
+      <button id="retry-model" hidden>Retry model</button>
+    </div>
+  </div>
+
+  <script>
+    // Put new GLB files in models/ and add their coordinates here. Use ?scout to collect coordinates.
+    const OBJECTS = [
+      { name: "Cigarette and ashtray", src: "models/fixedcig+animation.glb", lat: 40.000680, lon: -83.011150, repetitions: 3, primaryAnimation: "Cube.003Action", playAdditionalAnimations: true },
+      { name: "Laptop", src: "models/animatedLaptop.glb", lat: 40.000638, lon: -83.011154, repetitions: Infinity, delay: 4000, playAdditionalAnimations: true },
+    ];
+    const RADIUS = 15; // metres
+    const MAX_GPS_ERROR = 30;
+    const params = new URLSearchParams(location.search);
+    const PREVIEW = params.has("preview");
+    const SCOUT = !PREVIEW && params.has("scout");
+    const FAKE = !PREVIEW && !SCOUT && params.has("fake");
+
+    const $status = document.getElementById("status");
+    const $coords = document.getElementById("coords");
+    const $stage = document.getElementById("object-stage");
+    const $go = document.getElementById("go");
+    const $openNearby = document.getElementById("open-nearby");
+    const $models = document.getElementById("models");
+    const $message = document.getElementById("model-message");
+    const $modelStatus = document.getElementById("model-status");
+    const $retryModel = document.getElementById("retry-model");
+    const $close = document.getElementById("close-model");
+    const $mark = document.getElementById("mark");
+
+    let activeObject = null;
+    let lastCoords = null;
+    let clearViewer = () => {};
+    let gpsWatch = null;
+    let waitForNearbyTap = false;
+
+    $openNearby.onclick = () => {
+      if (!lastCoords) return;
+      waitForNearbyTap = false;
+      onPosition({ coords: lastCoords });
+    };
+
+    function setModelMessage(message, { retry = false, arError = false } = {}) {
+      $modelStatus.textContent = message;
+      $message.hidden = !message;
+      $message.classList.toggle("ar-error", arError);
+      $retryModel.hidden = !retry;
+    }
+
+    function showModel(object, { reload = false } = {}) {
+      clearViewer();
+      activeObject = object;
+      $stage.classList.add("open");
+      setModelMessage("Loading " + object.name + "…");
+
+      const viewer = document.createElement("model-viewer");
+      viewer.setAttribute("alt", object.name);
+      viewer.setAttribute("ar", "");
+      viewer.setAttribute("ar-modes", "webxr scene-viewer quick-look");
+      viewer.setAttribute("ar-placement", "floor");
+      viewer.setAttribute("camera-controls", "");
+      viewer.setAttribute("shadow-intensity", "1");
+      // The viewer stops all tracks when its primary clip finishes. Use the longest cigarette clip.
+      if (object.primaryAnimation) viewer.setAttribute("animation-name", object.primaryAnimation);
+
+      const arButton = document.createElement("button");
+      arButton.slot = "ar-button";
+      arButton.textContent = "View in AR";
+      arButton.hidden = true;
+      viewer.append(arButton);
+
+      const events = new AbortController();
+      const { signal } = events;
+      let animationTimer;
+      let failed = false;
+      const loadTimer = setTimeout(() => showError(), 25000);
+
+      function showError() {
+        failed = true;
+        clearTimeout(loadTimer);
+        clearTimeout(animationTimer);
+        arButton.hidden = true;
+        setModelMessage("Couldn’t load the model. Check your connection and try again.", { retry: true });
+      }
+
+      viewer.addEventListener("load", () => {
+        if (failed) return;
+        clearTimeout(loadTimer);
+        object.unlocked = true;
+        arButton.hidden = false;
+        setModelMessage("");
+        animationTimer = setTimeout(() => {
+          if (!viewer.availableAnimations.length) return;
+          viewer.play({ repetitions: object.repetitions });
+          if (object.playAdditionalAnimations) {
+            const primary = object.primaryAnimation || viewer.availableAnimations[0];
+            for (const name of viewer.availableAnimations) {
+              if (name === primary) continue;
+              viewer.appendAnimation(name, { repetitions: object.repetitions });
+            }
+          }
+        }, object.delay || 0);
+      }, { once: true, signal });
+
+      viewer.addEventListener("error", showError, { once: true, signal });
+      viewer.addEventListener("ar-status", ({ detail }) => {
+        if (!viewer.loaded || failed) return;
+        if (detail.status === "failed") {
+          setModelMessage("Couldn’t open AR. You can still explore the 3D model.", { arError: true });
+        } else {
+          setModelMessage("");
+        }
+      }, { signal });
+
+      clearViewer = () => {
+        events.abort();
+        clearTimeout(loadTimer);
+        clearTimeout(animationTimer);
+        if (viewer.loaded) viewer.pause();
+        viewer.remove();
+        clearViewer = () => {};
+      };
+
+      const src = new URL(object.src, document.baseURI);
+      if (reload) src.searchParams.set("retry", Date.now());
+      viewer.setAttribute("src", src.href);
+      $models.append(viewer);
+      if (!PREVIEW) $close.focus();
+    }
+
+    $retryModel.onclick = () => {
+      if (activeObject) showModel(activeObject, { reload: true });
+    };
+
+    $close.onclick = () => {
+      if (!activeObject) return;
+      clearViewer();
+      activeObject = null;
+      $stage.classList.remove("open");
+      if (OBJECTS.every((object) => object.unlocked)) {
+        showComplete();
+      } else if (!FAKE && lastCoords) {
+        waitForNearbyTap = true;
+        onPosition({ coords: lastCoords });
+        if (!$openNearby.hidden) $openNearby.focus();
+      }
+    };
+
+    if (PREVIEW && OBJECTS.length) {
+      const index = Number(params.get("preview")) - 1;
+      document.body.classList.add("preview");
+      showModel(OBJECTS[index] ?? OBJECTS[0]);
+    }
+
+    if (SCOUT) {
+      document.querySelector("h1").textContent = "Scout the Oval";
+      document.querySelector("#panel p").textContent = "Walk around and mark the spots you like.";
+    }
+
+    function stopGps() {
+      if (gpsWatch === null) return;
+      navigator.geolocation.clearWatch(gpsWatch);
+      gpsWatch = null;
+    }
+
+    function onGpsError(err) {
+      stopGps();
+      lastCoords = null;
+      $coords.textContent = "";
+      $mark.disabled = true;
+      $openNearby.hidden = true;
+      $status.textContent = "GPS error: " + err.message;
+      $go.textContent = "Try again";
+      $go.hidden = false;
+    }
+
+    function onScoutPosition({ coords }) {
+      lastCoords = coords;
+      $mark.disabled = false;
+      $status.textContent = `±${Math.round(coords.accuracy)} m ${coords.accuracy <= 10 ? "· good" : "· wait…"}`;
+      $coords.textContent = `${coords.latitude.toFixed(6)}, ${coords.longitude.toFixed(6)}`;
+    }
+
+    $go.onclick = () => {
+      if ($go.hidden) return;
+      $go.hidden = true;
+      if (FAKE) {
+        fakeWalk();
+        return;
+      }
+      if (!window.isSecureContext) {
+        onGpsError({ message: "Open the HTTPS version to use GPS." });
+        return;
+      }
+      if (!navigator.geolocation) {
+        onGpsError({ message: "This browser doesn't provide location access." });
+        return;
+      }
+      if (SCOUT) {
+        document.getElementById("scout").classList.add("on");
+        renderSpots();
+      }
+      $status.textContent = "Waiting for GPS…";
+      gpsWatch = navigator.geolocation.watchPosition(
+        SCOUT ? onScoutPosition : onPosition,
+        onGpsError,
+        { enableHighAccuracy: true, timeout: 15000 }
+      );
+    };
+
+    function showComplete() {
+      stopGps();
+      $openNearby.hidden = true;
+      $go.hidden = true;
+      $status.textContent = "You've found every object.";
+    }
+
+    // The GPS listener: runs every time the phone reports a new position.
+    function onPosition({ coords }, candidates = OBJECTS) {
+      lastCoords = coords;
+      $coords.textContent = `you: ${coords.latitude.toFixed(6)}, ${coords.longitude.toFixed(6)} · ±${Math.round(coords.accuracy)} m`;
+      if (activeObject) return;
+      const nearest = candidates.filter((object) => !object.unlocked)
+        .map((object) => ({ object, distance: distance(coords.latitude, coords.longitude, object.lat, object.lon) }))
+        .sort((a, b) => a.distance - b.distance)[0];
+      $openNearby.hidden = true;
+      if (!nearest) {
+        showComplete();
+      } else if (coords.accuracy > MAX_GPS_ERROR) {
+        $status.textContent = "Waiting for a more accurate GPS fix…";
+      } else if (nearest.distance <= RADIUS) {
+        if (waitForNearbyTap) {
+          $status.textContent = "Another object is nearby.";
+          $openNearby.hidden = false;
+          return;
+        }
+        showModel(nearest.object);
+        $status.textContent = "Found it.";
+      } else {
+        waitForNearbyTap = false;
+        $status.textContent = `${Math.round(nearest.distance)} m away · head ${compass(coords.latitude, coords.longitude, nearest.object.lat, nearest.object.lon)}`;
+      }
+    }
+
+    // Simulate a separate approach to each object so overlapping areas don't change demo order.
+    function fakeWalk() {
+      let current;
+      let metresSouth;
+      const step = () => {
+        if (activeObject) return;
+        const target = OBJECTS.find((object) => !object.unlocked);
+        if (!target) {
+          clearInterval(timer);
+          showComplete();
+          return;
+        }
+        if (current !== target) {
+          current = target;
+          metresSouth = 60;
+        }
+        onPosition({
+          coords: { latitude: target.lat - metresSouth / 111320, longitude: target.lon, accuracy: 0 }
+        }, [target]);
+        metresSouth = Math.max(0, metresSouth - 10);
+      };
+      const timer = setInterval(step, 400);
+      step();
+    }
+
+    $mark.onclick = () => {
+      if (!lastCoords) return;
+      const note = prompt("Note for this spot (e.g. 'bench by Orton Hall'):");
+      if (note === null) return;
+      const { latitude, longitude, accuracy } = lastCoords;
+      const spots = loadSpots();
+      spots.push({ lat: +latitude.toFixed(6), lon: +longitude.toFixed(6), acc: Math.round(accuracy), note,
+                   time: new Date().toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" }) });
+      try {
+        localStorage.setItem("spots", JSON.stringify(spots));
+        renderSpots();
+      } catch {
+        $status.textContent = "Couldn’t save this spot. Copy the coordinates shown below.";
+      }
+    };
+
+    function renderSpots() {
+      const list = document.getElementById("spots");
+      list.replaceChildren(...loadSpots().map((spot, i) => {
+        const item = document.createElement("li");
+        const label = document.createElement("b");
+        label.textContent = `${i + 1}. ${spot.note || "spot"}`;
+        item.append(label, ` · ${spot.time} · ±${spot.acc} m`, document.createElement("br"),
+                    `{ lat: ${spot.lat}, lon: ${spot.lon} }`);
+        return item;
+      }).reverse());
+    }
+
+    function loadSpots() {
+      try {
+        const spots = JSON.parse(localStorage.getItem("spots"));
+        return Array.isArray(spots) ? spots.filter((spot) => spot && Number.isFinite(spot.lat) && Number.isFinite(spot.lon)) : [];
+      } catch {
+        return [];
+      }
+    }
+
+    // ── helpers ──
+    function distance(lat1, lon1, lat2, lon2) {
+      const r = Math.PI / 180, a = Math.sin((lat2 - lat1) * r / 2) ** 2 +
+        Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin((lon2 - lon1) * r / 2) ** 2;
+      return 12742000 * Math.asin(Math.sqrt(a));
+    }
+    function compass(lat, lon, targetLat, targetLon) {
+      const r = Math.PI / 180;
+      const y = Math.sin((targetLon - lon) * r) * Math.cos(targetLat * r);
+      const x = Math.cos(lat * r) * Math.sin(targetLat * r) - Math.sin(lat * r) * Math.cos(targetLat * r) * Math.cos((targetLon - lon) * r);
+      return ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][Math.round(((Math.atan2(y, x) / r + 360) % 360) / 45) % 8];
+    }
+  </script>
+</body>
+</html>
